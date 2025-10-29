@@ -23,8 +23,15 @@ import org.apache.flink.api.common.state.StateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.core.memory.DataInputDeserializer;
+import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.runtime.state.CompositeKeySerializationUtils;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.state.RegisteredKeyValueStateBackendMetaInfo;
 import org.apache.flink.runtime.state.internal.InternalValueState;
+
+import org.apache.flink.runtime.state.internal.KeyAccessibleState;
+import org.apache.flink.util.FlinkRuntimeException;
 
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.RocksDBException;
@@ -39,7 +46,14 @@ import java.io.IOException;
  * @param <V> The type of value that the state state stores.
  */
 class RocksDBValueState<K, N, V> extends AbstractRocksDBState<K, N, V>
-        implements InternalValueState<K, N, V> {
+        implements InternalValueState<K, N, V>, KeyAccessibleState<K, V> {
+
+    /** Serializer used from async threads**/
+    private final ThreadLocal<DataOutputSerializer> asyncAccessDataOutputSerializer;
+    private final ThreadLocal<DataInputDeserializer> asyncAccessDataInputSerializer;
+    private final ThreadLocal<TypeSerializer<V>> asyncAccessValueSerializer;
+    private final ThreadLocal<TypeSerializer<K>> asyncAccessKeySerializer;
+    private final ThreadLocal<TypeSerializer<N>> asyncAccessNamespaceSerializer;
 
     /**
      * Creates a new {@code RocksDBValueState}.
@@ -58,6 +72,12 @@ class RocksDBValueState<K, N, V> extends AbstractRocksDBState<K, N, V>
             RocksDBKeyedStateBackend<K> backend) {
 
         super(columnFamily, namespaceSerializer, valueSerializer, defaultValue, backend);
+
+        this.asyncAccessDataOutputSerializer = ThreadLocal.withInitial(() -> new DataOutputSerializer(128));
+        this.asyncAccessDataInputSerializer = ThreadLocal.withInitial(() -> new DataInputDeserializer());
+        this.asyncAccessValueSerializer = ThreadLocal.withInitial(valueSerializer::duplicate);
+        this.asyncAccessKeySerializer = ThreadLocal.withInitial(backend.getKeySerializer()::duplicate);
+        this.asyncAccessNamespaceSerializer = ThreadLocal.withInitial(namespaceSerializer::duplicate);
     }
 
     @Override
@@ -91,6 +111,80 @@ class RocksDBValueState<K, N, V> extends AbstractRocksDBState<K, N, V>
         }
     }
 
+    // main thread
+    public V valueOfKey(K key) throws IOException {
+        try {
+            byte[] valueBytes =
+                    backend.db.get(columnFamily, mySerializeCurrentKeyWithGroupAndNamespace(key));
+
+            if (valueBytes == null) {
+                return getDefaultValue();
+            }
+            DataInputDeserializer dataInputViewLocal = asyncAccessDataInputSerializer.get();
+            dataInputViewLocal.setBuffer(valueBytes);
+            return asyncAccessValueSerializer.get().deserialize(dataInputViewLocal);
+        } catch (RocksDBException e) {
+            throw new IOException("Error while retrieving data from RocksDB.", e);
+        }
+    }
+
+    @Override
+    // main thread
+    public V get(K key) throws IOException, RocksDBException {
+        //K oldKey = backend.getCurrentKey();
+        // N oldNamespace = currentNamespace;
+        //backend.setCurrentKey(key);
+        //setCurrentNamespace(namespace); // no need to change the namespace since I do not have windows
+        V value = valueOfKey(key);
+        //backend.setCurrentKey(oldKey);
+        //setCurrentNamespace(oldNamespace);
+        return value;
+    }
+
+    @Override
+    // prefetching thread
+    public byte[] getRawBytes(K key) throws IOException, RocksDBException {
+        byte[] serializedKey = mySerializeCurrentKeyWithGroupAndNamespace(key);
+        return backend.db.get(columnFamily, serializedKey);
+    }
+
+    @Override
+    // main thread
+    public V deserializeRawBytes(byte[] valueBytes) throws IOException {
+        if (valueBytes == null) {
+            return getDefaultValue();
+        }
+        // safe to use the shared dataInputView since this method is called by the main thread only
+        DataInputDeserializer dataInputViewLocal = asyncAccessDataInputSerializer.get();
+        dataInputViewLocal.setBuffer(valueBytes);
+        return asyncAccessValueSerializer.get().deserialize(dataInputViewLocal);
+    }
+
+    // prefetching thread
+    private byte[] mySerializeCurrentKeyWithGroupAndNamespace(K key) throws IOException {
+        // build composite RocksDB key without touching backend.currentKey/namespace
+
+        // 1) write key-group prefix
+        final int keyGroupId = KeyGroupRangeAssignment.assignToKeyGroup(
+                key, backend.getNumberOfKeyGroups());
+
+        DataOutputSerializer out = asyncAccessDataOutputSerializer.get();
+
+        out.clear();
+
+        CompositeKeySerializationUtils.writeKeyGroup(keyGroupId, backend.getKeyGroupPrefixBytes(), out);
+
+        // 2) write user key
+        asyncAccessKeySerializer.get().serialize(key, out);
+
+        // 3) write namespace
+        asyncAccessNamespaceSerializer.get().serialize(currentNamespace, out);
+
+        byte[] res = out.getCopyOfBuffer();
+
+        return res;
+    }
+
     @Override
     public void update(V value) throws IOException {
         if (value == null) {
@@ -104,6 +198,49 @@ class RocksDBValueState<K, N, V> extends AbstractRocksDBState<K, N, V>
                     writeOptions,
                     serializeCurrentKeyWithGroupAndNamespace(),
                     serializeValue(value));
+        } catch (RocksDBException e) {
+            throw new IOException("Error while adding data to RocksDB", e);
+        }
+    }
+
+    @Override
+    // main thread
+    public void update(K key, V value) throws IOException, RocksDBException {
+        K oldKey = backend.getCurrentKey();
+        //N oldNamespace = namespace;
+        backend.setCurrentKey(key);
+        //setCurrentNamespace(namespace);
+        updateAsync(key, value);
+        if (oldKey != null) {
+            backend.setCurrentKey(oldKey);
+        }
+        //setCurrentNamespace(oldNamespace);
+    }
+
+    @Override
+    // async threads and main
+    public void updateAsync(K key, V value) throws IOException {
+        if (value == null) {
+            //clear
+            try {
+                backend.db.delete(
+                        columnFamily, writeOptions, mySerializeCurrentKeyWithGroupAndNamespace(key));
+            } catch (RocksDBException e) {
+                throw new FlinkRuntimeException("Error while removing entry from RocksDB", e);
+            }
+            return;
+        }
+
+        try{
+            DataOutputSerializer myDataOutput = asyncAccessDataOutputSerializer.get();
+            myDataOutput.clear();
+            asyncAccessValueSerializer.get().serialize(value, myDataOutput);
+            byte[] serializedVal = myDataOutput.getCopyOfBuffer();
+            backend.db.put(
+                    columnFamily,
+                    writeOptions,
+                    mySerializeCurrentKeyWithGroupAndNamespace(key),
+                    serializedVal);
         } catch (RocksDBException e) {
             throw new IOException("Error while adding data to RocksDB", e);
         }

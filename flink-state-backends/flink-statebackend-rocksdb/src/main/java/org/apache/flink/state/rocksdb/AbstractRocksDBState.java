@@ -59,7 +59,7 @@ public abstract class AbstractRocksDBState<K, N, V> implements InternalKvState<K
     TypeSerializer<V> valueSerializer;
 
     /** The current namespace, which the next value methods will refer to. */
-    private N currentNamespace;
+    protected N currentNamespace;
 
     /** Backend that holds the actual RocksDB instance where we store state. */
     protected RocksDBKeyedStateBackend<K> backend;
@@ -157,7 +157,7 @@ public abstract class AbstractRocksDBState<K, N, V> implements InternalKvState<K
                 currentNamespace, namespaceSerializer, userKey, userKeySerializer);
     }
 
-    private <T> byte[] serializeValueInternal(T value, TypeSerializer<T> serializer)
+    public <T> byte[] serializeValueInternal(T value, TypeSerializer<T> serializer)
             throws IOException {
         serializer.serialize(value, dataOutputView);
         return dataOutputView.getCopyOfBuffer();

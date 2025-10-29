@@ -28,7 +28,7 @@ import java.util.List;
  *
  * @param <T> The type of elements in the list state.
  */
-class UserFacingListState<T> implements ListState<T> {
+public class UserFacingListState<T> implements ListState<T> {
 
     private final ListState<T> originalState;
 
@@ -64,5 +64,9 @@ class UserFacingListState<T> implements ListState<T> {
     @Override
     public void addAll(List<T> values) throws Exception {
         originalState.addAll(values);
+    }
+
+    public ListState<T> getOriginalState() {
+        return originalState;
     }
 }

@@ -26,10 +26,13 @@ import org.apache.flink.api.common.typeutils.base.ListSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.runtime.state.CompositeKeySerializationUtils;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.state.ListDelimitedSerializer;
 import org.apache.flink.runtime.state.RegisteredKeyValueStateBackendMetaInfo;
 import org.apache.flink.runtime.state.StateSnapshotTransformer;
 import org.apache.flink.runtime.state.internal.InternalListState;
+import org.apache.flink.runtime.state.internal.KeyAccessibleState;
 import org.apache.flink.runtime.state.ttl.TtlAwareSerializer;
 import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
 import org.apache.flink.util.FlinkRuntimeException;
@@ -61,7 +64,7 @@ import static org.apache.flink.runtime.state.StateSnapshotTransformer.Collection
  * @param <V> The type of the values in the list state.
  */
 class RocksDBListState<K, N, V> extends AbstractRocksDBState<K, N, List<V>>
-        implements InternalListState<K, N, V> {
+        implements InternalListState<K, N, V>, KeyAccessibleState<K, List<V>> {
 
     /** Serializer for the values. */
     private TypeSerializer<V> elementSerializer;
@@ -70,6 +73,16 @@ class RocksDBListState<K, N, V> extends AbstractRocksDBState<K, N, List<V>>
 
     /** Separator of StringAppendTestOperator in RocksDB. */
     private static final byte DELIMITER = ',';
+
+    /** Serializer used from async threads**/
+    private final ThreadLocal<DataOutputSerializer> asyncAccessDataOutputSerializer;
+    private final ThreadLocal<DataInputDeserializer> asyncAccessDataInputSerializer;
+    private final ThreadLocal<TypeSerializer<V>> asyncAccessElementSerializer;
+    private final ThreadLocal<ListDelimitedSerializer> asyncAccessListSerializer;
+    private final ThreadLocal<TypeSerializer<K>> asyncAccessKeySerializer;
+    private final ThreadLocal<TypeSerializer<N>> asyncAccessNamespaceSerializer;
+
+
 
     /**
      * Creates a new {@code RocksDBListState}.
@@ -92,6 +105,12 @@ class RocksDBListState<K, N, V> extends AbstractRocksDBState<K, N, List<V>>
         ListSerializer<V> castedListSerializer = (ListSerializer<V>) valueSerializer;
         this.elementSerializer = castedListSerializer.getElementSerializer();
         this.listSerializer = new ListDelimitedSerializer();
+        this.asyncAccessDataOutputSerializer = ThreadLocal.withInitial(() -> new DataOutputSerializer(32));
+        this.asyncAccessElementSerializer = ThreadLocal.withInitial(() -> elementSerializer.duplicate());
+        this.asyncAccessDataInputSerializer = ThreadLocal.withInitial(() -> new DataInputDeserializer());
+        this.asyncAccessKeySerializer = ThreadLocal.withInitial(backend.getKeySerializer()::duplicate);
+        this.asyncAccessNamespaceSerializer = ThreadLocal.withInitial(namespaceSerializer::duplicate);
+        this.asyncAccessListSerializer = ThreadLocal.withInitial(() -> new ListDelimitedSerializer());
     }
 
     @Override
@@ -119,6 +138,63 @@ class RocksDBListState<K, N, V> extends AbstractRocksDBState<K, N, List<V>>
         byte[] key = serializeCurrentKeyWithGroupAndNamespace();
         byte[] valueBytes = backend.db.get(columnFamily, key);
         return listSerializer.deserializeList(valueBytes, elementSerializer);
+    }
+
+    public List<V> getInternal(K key) throws IOException, RocksDBException {
+        byte[] keyBytes = mySerializeCurrentKeyWithGroupAndNamespace(key);
+        byte[] valueBytes = backend.db.get(columnFamily, keyBytes);
+        return asyncAccessListSerializer.get().deserializeList(valueBytes, asyncAccessElementSerializer.get());
+    }
+
+    @Override
+    // main thread
+    public List<V> get(K key) throws IOException, RocksDBException {
+        //K oldKey = backend.getCurrentKey();
+        // N oldNamespace = currentNamespace;
+        //backend.setCurrentKey(key);
+        //setCurrentNamespace(namespace); // no need to change the namespace since I do not have windows
+        List<V> value = getInternal(key);
+        //backend.setCurrentKey(oldKey);
+        //setCurrentNamespace(oldNamespace);
+        return value;
+    }
+
+    @Override
+    // prefetching thread
+    public byte[] getRawBytes(K key) throws IOException, RocksDBException {
+        byte[] serializedKey = mySerializeCurrentKeyWithGroupAndNamespace(key);
+        return backend.db.get(columnFamily, serializedKey);
+    }
+
+    @Override
+    // main thread
+    public List<V> deserializeRawBytes(byte[] valueBytes) throws IOException {
+        return asyncAccessListSerializer.get().deserializeList(valueBytes, asyncAccessElementSerializer.get());
+    }
+
+    // prefetching thread
+    private byte[] mySerializeCurrentKeyWithGroupAndNamespace(K key) throws IOException {
+        // build composite RocksDB key without touching backend.currentKey/namespace
+
+        // 1) write key-group prefix
+        final int keyGroupId = KeyGroupRangeAssignment.assignToKeyGroup(
+                key, backend.getNumberOfKeyGroups());
+
+        DataOutputSerializer out = asyncAccessDataOutputSerializer.get();
+
+        out.clear();
+
+        CompositeKeySerializationUtils.writeKeyGroup(keyGroupId, backend.getKeyGroupPrefixBytes(), out);
+
+        // 2) write user key
+        asyncAccessKeySerializer.get().serialize(key, out);
+
+        // 3) write namespace
+        asyncAccessNamespaceSerializer.get().serialize(currentNamespace, out);
+
+        byte[] res = out.getCopyOfBuffer();
+
+        return res;
     }
 
     @Override
@@ -179,6 +255,42 @@ class RocksDBListState<K, N, V> extends AbstractRocksDBState<K, N, List<V>>
                     listSerializer.serializeList(values, elementSerializer));
         } else {
             clear();
+        }
+    }
+
+    @Override
+    // main thread
+    public void update(K key, List<V> valueToStore) throws IOException, RocksDBException {
+        //K oldKey = backend.getCurrentKey();
+        //N oldNamespace = namespace;
+        //backend.setCurrentKey(key);
+        //setCurrentNamespace(namespace);
+        updateAsync(key, valueToStore);
+        //if (oldKey != null) {
+        //    backend.setCurrentKey(oldKey);
+        //}
+        //setCurrentNamespace(oldNamespace);
+    }
+
+    @Override
+    // async threads
+    public void updateAsync(K key, List<V> values) throws IOException, RocksDBException {
+        Preconditions.checkNotNull(values, "List of values to add cannot be null.");
+
+        if (!values.isEmpty()) {
+            backend.db.put(
+                    columnFamily,
+                    writeOptions,
+                    mySerializeCurrentKeyWithGroupAndNamespace(key),
+                    asyncAccessListSerializer.get().serializeList(values, asyncAccessElementSerializer.get()));
+        } else {
+            // clear
+            try {
+                backend.db.delete(
+                        columnFamily, writeOptions, mySerializeCurrentKeyWithGroupAndNamespace(key));
+            } catch (RocksDBException e) {
+                throw new FlinkRuntimeException("Error while removing entry from RocksDB", e);
+            }
         }
     }
 
