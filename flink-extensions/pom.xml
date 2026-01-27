@@ -1,0 +1,182 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+		 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+		 xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.apache.flink</groupId>
+		<artifactId>flink-parent</artifactId>
+		<version>2.1-SNAPSHOT</version>
+	</parent>
+
+	<artifactId>flink-extensions_${scala.binary.version}</artifactId>
+	<packaging>jar</packaging>
+
+	<properties>
+		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+	</properties>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-runtime_${scala.binary.version}</artifactId>
+			<!-- circumvent cyclic dependency with pre-built Flink :)) (dependency only needed for type information) -->
+			<version>1.13.6</version>
+			<scope>provided</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.scala-lang</groupId>
+			<artifactId>scala-reflect</artifactId>
+		</dependency>
+
+		<!-- https://mvnrepository.com/artifact/org.jgrapht/jgrapht-core -->
+		<dependency>
+			<groupId>org.jgrapht</groupId>
+			<artifactId>jgrapht-core</artifactId>
+			<version>1.4.0</version>
+		</dependency>
+		<!-- https://mvnrepository.com/artifact/org.jgrapht/jgrapht-ext -->
+		<dependency>
+			<groupId>org.jgrapht</groupId>
+			<artifactId>jgrapht-ext</artifactId>
+			<version>1.4.0</version>
+		</dependency>
+		<!-- https://mvnrepository.com/artifact/org.jgrapht/jgrapht-io -->
+		<dependency>
+			<groupId>org.jgrapht</groupId>
+			<artifactId>jgrapht-io</artifactId>
+			<version>1.4.0</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-shaded-guava</artifactId>
+		</dependency>
+
+	</dependencies>
+
+	<build>
+
+		<resources>
+			<resource>
+				<directory>src/main/resources</directory>
+				<filtering>false</filtering>
+			</resource>
+			<resource>
+				<directory>src/main/resources-filtered</directory>
+				<filtering>true</filtering>
+			</resource>
+		</resources>
+
+		<plugins>
+			<plugin>
+				<!-- Description: https://github.com/git-commit-id/git-commit-id-maven-plugin
+					Used to show the git ref when starting the jobManager. -->
+				<groupId>pl.project13.maven</groupId>
+				<artifactId>git-commit-id-plugin</artifactId>
+				<version>4.0.2</version>
+				<executions>
+					<execution>
+						<id>get-the-git-infos</id>
+						<phase>validate</phase>
+						<goals>
+							<goal>revision</goal>
+						</goals>
+					</execution>
+				</executions>
+				<configuration>
+					<skipPoms>false</skipPoms>
+					<failOnNoGitDirectory>false</failOnNoGitDirectory>
+					<failOnUnableToExtractRepoInfo>false</failOnUnableToExtractRepoInfo>
+					<gitDescribe>
+						<!-- Don't generate the describe property -->
+						<!-- It is useless due to the way Flink does branches and tags -->
+						<skip>true</skip>
+					</gitDescribe>
+				</configuration>
+			</plugin>
+
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-enforcer-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>dependency-convergence</id>
+						<goals>
+							<goal>enforce</goal>
+						</goals>
+						<configuration>
+							<skip>true</skip>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-checkstyle-plugin</artifactId>
+
+				<configuration>
+					<suppressionsLocation combine.self="override">/tools/maven/suppressions-runtime.xml</suppressionsLocation>
+				</configuration>
+			</plugin>
+
+			<!-- Add version to jar http://stackoverflow.com/questions/2712970/how-to-get-maven-artifact-version-at-runtime
+				-->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-jar-plugin</artifactId>
+				<inherited>true</inherited>
+				<configuration>
+					<archive>
+						<manifest>
+							<addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+							<addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
+						</manifest>
+					</archive>
+				</configuration>
+				<executions>
+					<execution>
+						<goals>
+							<goal>test-jar</goal>
+						</goals>
+						<configuration>
+							<excludes>
+								<!-- test-jar is still used by JUnit4 modules -->
+								<exclude>META-INF/services/org.junit.jupiter.api.extension.Extension</exclude>
+							</excludes>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-shade-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>shade-flink</id>
+						<phase>package</phase>
+						<goals>
+							<goal>shade</goal>
+						</goals>
+						<configuration>
+							<artifactSet>
+								<includes>
+									<include>io.airlift:aircompressor</include>
+								</includes>
+							</artifactSet>
+							<relocations>
+								<relocation>
+									<pattern>io.airlift.compress</pattern>
+									<shadedPattern>
+										org.apache.flink.shaded.io.airlift.compress
+									</shadedPattern>
+								</relocation>
+							</relocations>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+		</plugins>
+	</build>
+</project>
